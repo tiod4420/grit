@@ -67,10 +67,12 @@ impl GitRepository {
         Ok(repo)
     }
 
-    pub fn find(path: Option<impl AsRef<Path>>, required: bool) -> Result<Option<Self>> {
-        let path = match path {
-            Some(path) => path.as_ref().to_owned(),
-            None => PathBuf::from("."),
+    pub fn find(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+
+        let path = match path.as_os_str().is_empty() {
+            true => path.to_owned(),
+            false => PathBuf::from("."),
         };
 
         let path = fs::canonicalize(path)?;
@@ -78,14 +80,34 @@ impl GitRepository {
         for path in path.ancestors() {
             if path.join(".git").is_dir() {
                 let repo = Self::new(path, false)?;
-                return Ok(Some(repo));
+                return Ok(repo);
             }
         }
 
-        if !required {
-            Ok(None)
+        Err("No git repository.".into())
+    }
+
+    pub fn file<P: AsRef<Path>>(&self, paths: impl AsRef<[P]>) -> Result<PathBuf> {
+        let path = self.path(paths);
+
+        if path.is_file() {
+            Ok(path)
+        } else if path.exists() {
+            Err(format!("Not a regular file {}", path.display()).into())
         } else {
-            Err("No git repository.".into())
+            Err(format!("File does not exist {}", path.display()).into())
+        }
+    }
+
+    pub fn dir<P: AsRef<Path>>(&self, paths: impl AsRef<[P]>) -> Result<PathBuf> {
+        let path = self.path(paths);
+
+        if path.is_dir() {
+            Ok(path)
+        } else if path.exists() {
+            Err(format!("Not a directory {}", path.display()).into())
+        } else {
+            Err(format!("Directory does not exist {}", path.display()).into())
         }
     }
 
@@ -126,18 +148,6 @@ impl GitRepository {
             .iter()
             .map(AsRef::as_ref)
             .fold(self.gitdir.clone(), |acc, path| acc.join(path))
-    }
-
-    fn dir<P: AsRef<Path>>(&self, paths: impl AsRef<[P]>) -> Result<PathBuf> {
-        let path = self.path(paths);
-
-        if path.is_dir() {
-            Ok(path)
-        } else if path.exists() {
-            Err(format!("Not a directory {}", path.display()).into())
-        } else {
-            Err(format!("Directory does not exist {}", path.display()).into())
-        }
     }
 
     fn default_config() -> Ini {
