@@ -1,8 +1,10 @@
 use std::error::Error;
+use std::io::{stdout, Write};
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
+use grit::object::GitObject;
 use grit::repo::GitRepository;
 
 #[derive(Parser, Debug)]
@@ -16,7 +18,14 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Add,
-    CatFile,
+    /// Provide content of repository objects
+    CatFile {
+        /// Specify the type
+        #[arg(name = "type", default_value = "blob")]
+        obj_type: GitObjectType,
+        /// The object to display
+        object: String,
+    },
     CheckIgnore,
     Checkout,
     Commit,
@@ -37,12 +46,25 @@ pub enum Command {
     Tag,
 }
 
+#[derive(ValueEnum, Clone, Debug)]
+pub enum GitObjectType {
+    Blob,
+    Commit,
+    Tag,
+    Tree,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Cli::parse();
 
     match args.command {
         Command::Add => todo!(),
-        Command::CatFile => todo!(),
+        Command::CatFile { object, .. } => {
+            let repo = GitRepository::find(".")?;
+            let object = GitObject::read(&repo, object)?;
+            let data = object.serialize()?;
+            stdout().write_all(data)?;
+        }
         Command::CheckIgnore => todo!(),
         Command::Checkout => todo!(),
         Command::Commit => todo!(),
