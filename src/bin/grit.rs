@@ -1,6 +1,9 @@
 use std::error::Error;
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+
+use grit::repo::GitRepository;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -18,7 +21,12 @@ pub enum Command {
     Checkout,
     Commit,
     HashObject,
-    Init,
+    /// Initialize a new, empty repository.
+    Init {
+        /// Where to create the repository.
+        #[arg(name = "directory", default_value = ".")]
+        path: PathBuf,
+    },
     Log,
     LsFiles,
     LsTree,
@@ -39,7 +47,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Checkout => todo!(),
         Command::Commit => todo!(),
         Command::HashObject => todo!(),
-        Command::Init => todo!(),
+        Command::Init { path } => {
+            GitRepository::create(path)?;
+        }
         Command::Log => todo!(),
         Command::LsFiles => todo!(),
         Command::LsTree => todo!(),
