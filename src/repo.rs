@@ -8,10 +8,9 @@ use flate2::Compression;
 
 use ini::Ini;
 
-use sha1::{Digest, Sha1};
-
 use crate::error::{GritError, Result};
 use crate::object::{GitObject, GitObjectType};
+use crate::utils;
 
 const DEFAULT_BRANCH: &str = "master";
 const DEFAULT_DESCRIPTION: &str =
@@ -99,7 +98,7 @@ impl GitRepository {
     pub fn read(&self, sha: impl AsRef<str>) -> Result<GitObject> {
         let sha = sha.as_ref();
 
-        if !Self::is_hash(sha) {
+        if !utils::is_hash(sha) {
             return Err(GritError::InvalidHash(sha.into()));
         }
 
@@ -147,13 +146,8 @@ impl GitRepository {
         let header = object.header();
         let data = object.serialize();
 
-        // Compute hash
-        let mut sha = Sha1::new();
-        sha.update(&header);
-        sha.update(&data);
-        let sha = format!("{:x}", sha.finalize());
-
         // Write compressed data to file
+        let sha = utils::hash(&header, &data);
         let path = self.file(["objects", &sha[..2], &sha[2..]])?;
 
         // No need to write the file if already stored
@@ -259,10 +253,5 @@ impl GitRepository {
             .set("filemode", "false");
 
         config
-    }
-
-    fn is_hash(hash: impl AsRef<str>) -> bool {
-        let hash = hash.as_ref();
-        hash.len() == Sha1::output_size() && hash.chars().all(|c| c.is_ascii_hexdigit())
     }
 }

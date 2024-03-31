@@ -2,6 +2,7 @@ use std::fmt;
 use std::str;
 
 use crate::error::GritError;
+use crate::utils;
 
 #[derive(Clone, Copy, Debug)]
 pub enum GitObjectType {
@@ -68,5 +69,9 @@ impl GitObject {
             GitObjectType::Blob => self.data.clone(),
             _ => todo!(),
         }
+    }
+
+    pub fn hash(&self) -> String {
+        utils::hash(self.header(), self.serialize())
     }
 }
