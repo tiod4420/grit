@@ -1,10 +1,17 @@
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 
 use ini::Ini;
 
-use crate::Result;
+use sha1::{Digest, Sha1};
+
+use crate::error::{GritError, Result};
+use crate::object::{GitObject, GitObjectType};
 
 const DEFAULT_BRANCH: &str = "master";
 const DEFAULT_DESCRIPTION: &str =
@@ -21,19 +28,24 @@ impl GitRepository {
     pub fn create(worktree: impl AsRef<Path>) -> Result<Self> {
         let worktree = worktree.as_ref();
 
-        let repo = Self::new(worktree, true)?;
+        let repo = Self::new_unchecked(worktree);
 
         if repo.worktree.exists() {
             if !repo.worktree.is_dir() {
-                return Err(format!("{} is not a directory", repo.worktree.display()).into());
+                return Err(GritError::NotADirectory(repo.worktree));
             }
 
-            let is_empty = repo.gitdir.read_dir().unwrap().count() == 0;
-            if repo.gitdir.exists() && is_empty {
-                return Err(format!("{} is not empty", repo.gitdir.display()).into());
+            if repo.gitdir.exists() {
+                if !repo.gitdir.is_dir() {
+                    return Err(GritError::NotADirectory(repo.gitdir));
+                } else if repo.gitdir.read_dir()?.count() != 0 {
+                    return Err(GritError::InvalidGitRepo(
+                        "git directory is not empty".into(),
+                    ));
+                }
             }
         } else {
-            fs::create_dir_all(worktree)?;
+            fs::create_dir_all(&repo.worktree)?;
         }
 
         // .git/branches
@@ -71,68 +83,121 @@ impl GitRepository {
         let path = path.as_ref();
 
         let path = match path.as_os_str().is_empty() {
-            true => path.to_owned(),
-            false => PathBuf::from("."),
+            true => path,
+            false => Path::new("."),
         };
 
-        let path = fs::canonicalize(path)?;
-
-        for path in path.ancestors() {
-            if path.join(".git").is_dir() {
-                let repo = Self::new(path, false)?;
+        for path in fs::canonicalize(path)?.ancestors() {
+            if let Ok(repo) = Self::new(path) {
                 return Ok(repo);
             }
         }
 
-        Err("No git repository.".into())
+        Err(GritError::GitRepoNotFound)
     }
 
-    pub fn file<P: AsRef<Path>>(&self, paths: impl AsRef<[P]>) -> Result<PathBuf> {
-        let path = self.path(paths);
+    pub fn read(&self, sha: impl AsRef<str>) -> Result<GitObject> {
+        let sha = sha.as_ref();
 
-        if path.is_file() {
-            Ok(path)
-        } else if path.exists() {
-            Err(format!("Not a regular file {}", path.display()).into())
+        if !Self::is_hash(sha) {
+            return Err(GritError::InvalidHash(sha.into()));
+        }
+
+        let path = self.file(["objects", &sha[..2], &sha[2..]])?;
+
+        // Decompress file
+        let file = File::open(path)?;
+        let mut zlib = BufReader::new(ZlibDecoder::new(file));
+
+        // Get header
+        let mut header = Vec::new();
+        let null_byte = zlib.read_until(0x00, &mut header)?;
+
+        if Some(&0x00) != header.get(null_byte) {
+            return Err(GritError::InvalidHeader("null byte not found".into()));
+        }
+
+        // Parse header
+        let (obj, size) = std::str::from_utf8(&header[..null_byte - 1])
+            .map_err(|_| GritError::InvalidHeader("invalid UTF-8".into()))?
+            .split_once(' ')
+            .ok_or(GritError::InvalidHeader("space not found".into()))?;
+
+        let obj = obj.parse::<GitObjectType>()?;
+        let size = size
+            .parse::<usize>()
+            .map_err(|_| GritError::InvalidHeader("invalid data length".into()))?;
+
+        // Read remain of file
+        let mut data = Vec::new();
+        let data_sz = zlib.read_to_end(&mut data)?;
+
+        if size == data_sz {
+            Ok(GitObject::create(obj, data))
         } else {
-            Err(format!("File does not exist {}", path.display()).into())
+            Err(GritError::InvalidHeader(format!(
+                "header size {} != data size {}",
+                size, data_sz
+            )))
         }
     }
 
-    pub fn dir<P: AsRef<Path>>(&self, paths: impl AsRef<[P]>) -> Result<PathBuf> {
-        let path = self.path(paths);
+    pub fn write(&self, object: &GitObject) -> Result<()> {
+        // Serialize data and make header
+        let header = object.header();
+        let data = object.serialize();
 
-        if path.is_dir() {
-            Ok(path)
-        } else if path.exists() {
-            Err(format!("Not a directory {}", path.display()).into())
-        } else {
-            Err(format!("Directory does not exist {}", path.display()).into())
+        // Compute hash
+        let mut sha = Sha1::new();
+        sha.update(&header);
+        sha.update(&data);
+        let sha = format!("{:x}", sha.finalize());
+
+        // Write compressed data to file
+        let path = self.file(["objects", &sha[..2], &sha[2..]])?;
+
+        // No need to write the file if already stored
+        if !path.exists() {
+            // Path has a parent by construct
+            let parent = path.parent().unwrap();
+
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+            zlib.write_all(&header)?;
+            zlib.write_all(&data)?;
+            let compressed = zlib.finish()?;
+
+            let mut file = File::create(path)?;
+            file.write_all(&compressed)?;
         }
+
+        Ok(())
     }
 
-    fn new(worktree: impl AsRef<Path>, force: bool) -> Result<Self> {
+    fn new(worktree: impl AsRef<Path>) -> Result<Self> {
         let worktree = worktree.as_ref().to_owned();
         let gitdir = worktree.join(".git");
         let config = gitdir.join("config");
 
-        if !force && !gitdir.is_dir() {
-            return Err(format!("Not a Git repository {}", gitdir.display()).into());
+        if !gitdir.is_dir() {
+            return Err(GritError::GitRepoNotFound);
         }
 
-        let config = match Ini::load_from_file(config) {
-            Ok(config) => config,
-            Err(_) if force => Ini::new(),
-            Err(_) => Err("Configuration file missing")?,
-        };
+        let config = Ini::load_from_file(config).map_err(|_| GritError::MissingConfigFile)?;
 
         let version = config
             .get_from(Some("core"), "repositoryformatversion")
             .and_then(|val| val.parse::<i32>().ok())
             .unwrap_or(-1);
 
-        if !force && version != 0 {
-            return Err(format!("Unsupported repositoryformatversion {}", version).into());
+        if version != 0 {
+            return Err(GritError::InvalidGitRepo(format!(
+                "unsupported repositoryformatversion {}",
+                version
+            )));
         }
 
         Ok(Self {
@@ -142,12 +207,46 @@ impl GitRepository {
         })
     }
 
+    fn new_unchecked(worktree: impl AsRef<Path>) -> Self {
+        let worktree = worktree.as_ref().to_owned();
+        let gitdir = worktree.join(".git");
+        let config = gitdir.join("config");
+
+        let config = Ini::load_from_file(config).unwrap_or_default();
+
+        Self {
+            worktree,
+            gitdir,
+            config,
+        }
+    }
+
     fn path<P: AsRef<Path>>(&self, paths: impl AsRef<[P]>) -> PathBuf {
         paths
             .as_ref()
             .iter()
             .map(AsRef::as_ref)
             .fold(self.gitdir.clone(), |acc, path| acc.join(path))
+    }
+
+    fn file<P: AsRef<Path>>(&self, paths: impl AsRef<[P]>) -> Result<PathBuf> {
+        let path = self.path(paths);
+
+        if !path.exists() || path.is_file() {
+            Ok(path)
+        } else {
+            Err(GritError::NotAFile(path))
+        }
+    }
+
+    fn dir<P: AsRef<Path>>(&self, paths: impl AsRef<[P]>) -> Result<PathBuf> {
+        let path = self.path(paths);
+
+        if !path.exists() || path.is_dir() {
+            Ok(path)
+        } else {
+            Err(GritError::NotADirectory(path))
+        }
     }
 
     fn default_config() -> Ini {
@@ -160,5 +259,10 @@ impl GitRepository {
             .set("filemode", "false");
 
         config
+    }
+
+    fn is_hash(hash: impl AsRef<str>) -> bool {
+        let hash = hash.as_ref();
+        hash.len() == Sha1::output_size() && hash.chars().all(|c| c.is_ascii_hexdigit())
     }
 }
